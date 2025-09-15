@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Triple Pendulum — single file</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; }
+    body { margin: 0; background: #000; overflow: hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif; }
+    #ui { position: fixed; inset: 12px auto auto 12px; color: #bbb; user-select: none; font-size: 12px; line-height: 1.3; background: rgba(255,255,255,0.04); padding: 10px 12px; border-radius: 10px; backdrop-filter: blur(6px); border: 1px solid rgba(255,255,255,0.08); }
+    #ui button, #ui input[type="range"] { width: 100%; }
+    #ui .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+    #ui .muted { opacity: .8; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="ui">
+    <div class="row" style="gap:10px; grid-template-columns: auto auto auto auto;">
+      <button id="toggle">Pause</button>
+      <button id="reset">Reset</button>
+      <label class="muted"><input type="checkbox" id="trails" checked> Trails</label>
+      <label class="muted"><input type="checkbox" id="dragging" checked> Drag</label>
+    </div>
+    <div style="margin-top:8px" class="muted">Triple pendulum — constraint‑based Verlet (real‑time)</div>
+  </div>
+
+  <script>
+  (function(){
+    const dpi = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+
+    function resize(){
+      const w = window.innerWidth, h = window.innerHeight;
+      canvas.width = Math.floor(w * dpi);
+      canvas.height = Math.floor(h * dpi);
+      canvas.style.width = w + 'px';
+      canvas.style.height = h + 'px';
+      ctx.setTransform(dpi,0,0,dpi,0,0);
+    }
+    window.addEventListener('resize', resize, { passive:true });
+    resize();
+
+    // --- Physics (constraint-based Verlet integration) ---
+    // We simulate 3 masses linked by rigid rods of fixed length to a fixed anchor.
+    // This produces visually realistic motion for a triple pendulum without solving
+    // the full Lagrangian. Damping is applied to stabilize high-energy states.
+
+    // World params
+    const G = 980;          // gravity px/s^2 (assuming 100 px ~ 1 m, adjust visually)
+    const DAMPING = 0.999;  // global velocity damping per step (air resistance)
+    const ITER = 8;         // constraint iterations per step (higher = stiffer rods)
+
+    // Pendulum geometry & masses
+    const state = {
+      anchor: { x: 0, y: 0 },
+      points: [],
+      rods: [],
+      trails: true,
+      allowDrag: true,
+    };
+
+    function makePendulum(){
+      const w = canvas.width / dpi, h = canvas.height / dpi;
+      state.anchor.x = w * 0.5;
+      state.anchor.y = Math.max(60, h * 0.15);
+
+      state.points = []; // p0, p1, p2 are dynamic masses
+      const L1 = Math.min(w, h) * 0.22;
+      const L2 = Math.min(w, h) * 0.22;
+      const L3 = Math.min(w, h) * 0.22;
+
+      const m1 = 1.0, m2 = 1.0, m3 = 1.0; // masses (relative)
+
+      // initial angles (slightly offset for chaos)
+      let a1 = Math.PI * 0.7;
+      let a2 = Math.PI * 0.7 + 0.03;
+      let a3 = Math.PI * 0.7 - 0.02;
+
+      const p0 = makePoint(state.anchor.x + L1*Math.sin(a1), state.anchor.y + L1*Math.cos(a1), m1);
+      const p1 = makePoint(p0.x + L2*Math.sin(a2), p0.y + L2*Math.cos(a2), m2);
+      const p2 = makePoint(p1.x + L3*Math.sin(a3), p1.y + L3*Math.cos(a3), m3);
+
+      state.points.push(p0,p1,p2);
+
+      state.rods = [
+        { a: 'anchor', b: 0, L: L1 },
+        { a: 0, b: 1, L: L2 },
+        { a: 1, b: 2, L: L3 },
+      ];
+
+      // trail setup
+      trail.reset();
+    }
+
+    function makePoint(x,y,mass){
+      return {
+        x, y,
+        px: x, py: y, // previous position (for Verlet)
+        ax: 0, ay: 0,
+        mass: mass,
+        radius: 8 + 4*(1/mass),
+      };
+    }
+
+    // Mouse interaction (dragging masses)
+    let dragging = null;
+    let paused = false;
+
+    const ui = {
+      toggle: document.getElementById('toggle'),
+      reset: document.getElementById('reset'),
+      trails: document.getElementById('trails'),
+      dragging: document.getElementById('dragging'),
+    };
+
+    ui.toggle.addEventListener('click', ()=>{
+      paused = !paused; ui.toggle.textContent = paused ? 'Play' : 'Pause';
+    });
+    ui.reset.addEventListener('click', ()=>{ makePendulum(); });
+    ui.trails.addEventListener('change', (e)=>{ state.trails = !!e.target.checked; if(!state.trails) trail.reset(true); });
+    ui.dragging.addEventListener('change', (e)=>{ state.allowDrag = !!e.target.checked; if(!state.allowDrag) dragging = null; });
+
+    const mouse = { x:0, y:0, down:false };
+    canvas.addEventListener('pointerdown', (e)=>{
+      if(!state.allowDrag) return;
+      const r = canvas.getBoundingClientRect();
+      mouse.x = (e.clientX - r.left);
+      mouse.y = (e.clientY - r.top);
+      mouse.down = true;
+      // pick closest point within radius
+      let best = null, bestD2 = 1e9;
+      state.points.forEach((p,i)=>{
+        const dx = mouse.x - p.x, dy = mouse.y - p.y;
+        const d2 = dx*dx + dy*dy;
+        const rr = Math.max(18, p.radius+8);
+        if(d2 < rr*rr && d2 < bestD2){ bestD2 = d2; best = i; }
+      });
+      dragging = best;
+    });
+    canvas.addEventListener('pointermove', (e)=>{
+      const r = canvas.getBoundingClientRect();
+      mouse.x = (e.clientX - r.left);
+      mouse.y = (e.clientY - r.top);
+      if(mouse.down && dragging != null){
+        const p = state.points[dragging];
+        // place point at mouse; zero its velocity for stable dragging
+        p.x = mouse.x; p.y = mouse.y; p.px = mouse.x; p.py = mouse.y;
+      }
+    });
+    window.addEventListener('pointerup', ()=>{ mouse.down = false; dragging = null; });
+
+    // Trails buffer (for pretty chaotic curves)
+    const trail = (function(){
+      const maxN = 1800; // adjust for length of trail
+      let buf = new Float32Array(maxN*2);
+      let n = 0; // active points
+      function push(x,y){
+        if(!state.trails) return;
+        if(n*2 >= buf.length){
+          // drop first 10% to make room (cheap ring buffer)
+          const drop = Math.floor(buf.length*0.1);
+          buf.copyWithin(0, drop);
+          n -= Math.floor(drop/2);
+        }
+        buf[n*2] = x; buf[n*2+1] = y; n++;
+      }
+      function draw(ctx){
+        if(n < 2) return;
+        ctx.beginPath();
+        let alphaStep = 1 / Math.max(1, n);
+        for(let i=0;i<n;i++){
+          const x = buf[i*2], y = buf[i*2+1];
+          if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+        }
+        ctx.globalAlpha = 0.75; // overall trail opacity
+        ctx.lineWidth = 1.2;
+        ctx.strokeStyle = '#4de3ff';
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+      function reset(clear){ n = 0; if(clear) buf.fill(0); }
+      return { push, draw, reset };
+    })();
+
+    // Integrator step
+    let lastT = performance.now();
+    function step(){
+      const t = performance.now();
+      let dt = (t - lastT) / 1000; // seconds
+      lastT = t;
+      // clamp dt to prevent explosions on tab switches
+      dt = Math.min(1/30, Math.max(1/1000, dt));
+
+      if(!paused){
+        // Apply gravity and Verlet integrate
+        for(const p of state.points){
+          // acceleration
+          p.ay += G;
+          // Verlet position update
+          const vx = (p.x - p.px) * DAMPING;
+          const vy = (p.y - p.py) * DAMPING;
+          const nx = p.x + vx + p.ax * dt * dt;
+          const ny = p.y + vy + p.ay * dt * dt;
+          p.px = p.x; p.py = p.y;
+          p.x = nx; p.y = ny;
+          p.ax = 0; p.ay = 0;
+        }
+
+        // Satisfy constraints multiple times (Gauss-Seidel)
+        for(let k=0;k<ITER;k++){
+          // anchor-to-first rod
+          satisfyAnchor( state.rods[0] );
+          // other rods
+          satisfyRod( state.rods[1] );
+          satisfyRod( state.rods[2] );
+        }
+
+        // push trail for last bob
+        const last = state.points[state.points.length-1];
+        trail.push(last.x, last.y);
+      }
+
+      draw();
+      requestAnimationFrame(step);
+    }
+
+    function satisfyAnchor(rod){
+      const p = typeof rod.b === 'number' ? state.points[rod.b] : rod.b;
+      const ax = state.anchor.x, ay = state.anchor.y;
+      let dx = p.x - ax, dy = p.y - ay;
+      const dist = Math.hypot(dx,dy) || 1e-6;
+      const diff = (dist - rod.L) / dist;
+      // Move point only (anchor is fixed)
+      p.x -= dx * diff;
+      p.y -= dy * diff;
+    }
+
+    function satisfyRod(rod){
+      const a = typeof rod.a === 'number' ? state.points[rod.a] : rod.a;
+      const b = typeof rod.b === 'number' ? state.points[rod.b] : rod.b;
+      let dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.hypot(dx,dy) || 1e-6;
+      const diff = (dist - rod.L) / dist;
+      // inverse masses (0 means fixed)
+      const wa = 1 / a.mass;
+      const wb = 1 / b.mass;
+      const wsum = wa + wb;
+      if(wsum === 0) return;
+      const corrx = dx * diff;
+      const corry = dy * diff;
+      a.x += corrx * (wa/wsum);
+      a.y += corry * (wa/wsum);
+      b.x -= corrx * (wb/wsum);
+      b.y -= corry * (wb/wsum);
+    }
+
+    function draw(){
+      const w = canvas.width / dpi, h = canvas.height / dpi;
+      if(state.trails){
+        // Fade background for motion blur trails
+        ctx.fillStyle = 'rgba(0,0,0,0.25)';
+        ctx.fillRect(0,0,w,h);
+      } else {
+        ctx.clearRect(0,0,w,h);
+      }
+
+      // draw rods
+      ctx.lineWidth = 2.2; ctx.strokeStyle = '#ffffff'; ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.moveTo(state.anchor.x, state.anchor.y);
+      for(const p of state.points){ ctx.lineTo(p.x, p.y); }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      // draw anchor
+      ctx.fillStyle = '#bbb';
+      ctx.beginPath(); ctx.arc(state.anchor.x, state.anchor.y, 4, 0, Math.PI*2); ctx.fill();
+
+      // trail
+      trail.draw(ctx);
+
+      // draw masses
+      for(const p of state.points){
+        ctx.beginPath();
+        ctx.fillStyle = '#4de3ff';
+        ctx.arc(p.x, p.y, p.radius, 0, Math.PI*2);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+        ctx.stroke();
+      }
+    }
+
+    // init & run
+    makePendulum();
+    step();
+
+    // Keyboard shortcuts
+    window.addEventListener('keydown', (e)=>{
+      if(e.code === 'Space'){ ui.toggle.click(); e.preventDefault(); }
+      if(e.key.toLowerCase() === 'r'){ ui.reset.click(); }
+      if(e.key.toLowerCase() === 't'){ ui.trails.checked = !ui.trails.checked; ui.trails.dispatchEvent(new Event('change')); }
+      if(e.key.toLowerCase() === 'd'){ ui.dragging.checked = !ui.dragging.checked; ui.dragging.dispatchEvent(new Event('change')); }
+    });
+
+  })();
+  </script>
+</body>
+</html>
